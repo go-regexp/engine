@@ -2,7 +2,6 @@
 
 [![ci](https://github.com/go-regexp/engine/actions/workflows/ci.yml/badge.svg)](https://github.com/go-regexp/engine/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/go-regexp/engine.svg)](https://pkg.go.dev/github.com/go-regexp/engine)
-[![Go Report Card](https://goreportcard.com/badge/github.com/go-regexp/engine)](https://goreportcard.com/report/github.com/go-regexp/engine)
 [![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
 A pure-Go (cgo-free) regular-expression engine compatible with
