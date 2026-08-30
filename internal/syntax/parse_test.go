@@ -327,8 +327,10 @@ func TestParseClassEscapeMembers(t *testing.T) {
 }
 
 func TestParsePosixClasses(t *testing.T) {
-	// Every standard POSIX class name expands to the expected ASCII byte ranges
-	// (verified against MRI Onigmo 4.0.5).
+	// In ASCII-8BIT (/n) mode every standard POSIX class name expands to the
+	// expected ASCII byte ranges (verified against MRI Onigmo 4.0.5). On a UTF-8
+	// pattern the character-property classes widen to Unicode properties instead
+	// — that path is covered by TestParsePosixClassUnicode.
 	for _, tc := range []struct {
 		name string
 		want []ast.ClassRange
@@ -346,8 +348,13 @@ func TestParsePosixClasses(t *testing.T) {
 		{"punct", []ast.ClassRange{{Lo: '!', Hi: '/'}, {Lo: ':', Hi: '@'}, {Lo: '[', Hi: '`'}, {Lo: '{', Hi: '~'}}},
 		{"xdigit", []ast.ClassRange{{Lo: '0', Hi: '9'}, {Lo: 'A', Hi: 'F'}, {Lo: 'a', Hi: 'f'}}},
 		{"word", []ast.ClassRange{{Lo: '0', Hi: '9'}, {Lo: 'A', Hi: 'Z'}, {Lo: '_', Hi: '_'}, {Lo: 'a', Hi: 'z'}}},
+		{"ascii", []ast.ClassRange{{Lo: 0, Hi: 0x7f}}},
 	} {
-		r := mustParse(t, "[[:"+tc.name+":]]")
+		r, err := ParseEnc("[[:"+tc.name+":]]", ASCII8BIT)
+		if err != nil {
+			t.Errorf("[[:%s:]]: %v", tc.name, err)
+			continue
+		}
 		cls := r.Root.(*ast.Class)
 		if !reflect.DeepEqual(cls.Ranges, tc.want) {
 			t.Errorf("[[:%s:]] ranges = %v want %v", tc.name, cls.Ranges, tc.want)
@@ -358,9 +365,43 @@ func TestParsePosixClasses(t *testing.T) {
 	}
 }
 
+// TestParsePosixClassUnicode: on a UTF-8 pattern the character-property POSIX
+// classes are carried as \p{…} properties (matching the full Unicode set, as
+// MRI does), while [:ascii:] and the punctuation/layout classes stay as byte
+// ranges. The member-local negation of [[:^alpha:]] is carried on the property.
+func TestParsePosixClassUnicode(t *testing.T) {
+	for name, prop := range posixUnicodeProp {
+		r := mustParse(t, "[[:"+name+":]]")
+		cls := r.Root.(*ast.Class)
+		if !reflect.DeepEqual(cls.Props, []ast.PropRef{{Name: prop}}) {
+			t.Errorf("[[:%s:]] props = %v, want [{%s false}]", name, cls.Props, prop)
+		}
+		if len(cls.Ranges) != 0 {
+			t.Errorf("[[:%s:]] ranges = %v, want none", name, cls.Ranges)
+		}
+	}
+	// Negated form carries a member-local negation on the property.
+	r := mustParse(t, "[[:^alpha:]]")
+	cls := r.Root.(*ast.Class)
+	if !reflect.DeepEqual(cls.Props, []ast.PropRef{{Name: "Alpha", Negate: true}}) {
+		t.Errorf("[[:^alpha:]] props = %v", cls.Props)
+	}
+	// [:ascii:] on a UTF-8 pattern stays a byte range (ASCII by definition).
+	r = mustParse(t, "[[:ascii:]]")
+	cls = r.Root.(*ast.Class)
+	if len(cls.Props) != 0 || !reflect.DeepEqual(cls.Ranges, []ast.ClassRange{{Lo: 0, Hi: 0x7f}}) {
+		t.Errorf("[[:ascii:]] ranges=%v props=%v", cls.Ranges, cls.Props)
+	}
+}
+
 func TestParsePosixClassNegated(t *testing.T) {
-	// [[:^digit:]] is the complement of [0-9] over the full byte range.
-	r := mustParse(t, "[[:^digit:]]")
+	// In ASCII-8BIT mode [[:^digit:]] is the complement of [0-9] over the full
+	// byte range (the UTF-8 form carries a negated \p{Digit} — see
+	// TestParsePosixClassUnicode).
+	r, err := ParseEnc("[[:^digit:]]", ASCII8BIT)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
 	cls := r.Root.(*ast.Class)
 	want := []ast.ClassRange{{Lo: 0, Hi: '0' - 1}, {Lo: '9' + 1, Hi: 0xff}}
 	if !reflect.DeepEqual(cls.Ranges, want) {
@@ -370,17 +411,38 @@ func TestParsePosixClassNegated(t *testing.T) {
 
 func TestParsePosixClassMixedWithMembers(t *testing.T) {
 	// A POSIX class can be combined with ordinary members and other POSIX
-	// classes inside the same bracket expression.
+	// classes inside the same bracket expression. On a UTF-8 pattern the
+	// character-property classes ([:digit:], [:upper:]) match the full Unicode
+	// set and so are carried as \p{…} properties, leaving only the literal
+	// members as byte ranges.
 	r := mustParse(t, "[x[:digit:]_[:upper:]]")
 	cls := r.Root.(*ast.Class)
-	want := []ast.ClassRange{
+	wantRanges := []ast.ClassRange{
 		{Lo: 'x', Hi: 'x'},
-		{Lo: '0', Hi: '9'},
 		{Lo: '_', Hi: '_'},
-		{Lo: 'A', Hi: 'Z'},
 	}
-	if !reflect.DeepEqual(cls.Ranges, want) {
-		t.Fatalf("ranges = %v want %v", cls.Ranges, want)
+	if !reflect.DeepEqual(cls.Ranges, wantRanges) {
+		t.Fatalf("ranges = %v want %v", cls.Ranges, wantRanges)
+	}
+	wantProps := []ast.PropRef{{Name: "Digit"}, {Name: "Upper"}}
+	if !reflect.DeepEqual(cls.Props, wantProps) {
+		t.Fatalf("props = %v want %v", cls.Props, wantProps)
+	}
+}
+
+// TestParsePosixClassAsciiMode: in ASCII-8BIT (/n) mode the property classes
+// stay byte-oriented (no Unicode widening), matching MRI's /n behaviour.
+func TestParsePosixClassAsciiMode(t *testing.T) {
+	r, err := ParseEnc("[[:digit:]]", ASCII8BIT)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	cls := r.Root.(*ast.Class)
+	if len(cls.Props) != 0 {
+		t.Fatalf("ASCII8BIT [[:digit:]] props = %v, want none", cls.Props)
+	}
+	if !reflect.DeepEqual(cls.Ranges, []ast.ClassRange{{Lo: '0', Hi: '9'}}) {
+		t.Fatalf("ASCII8BIT [[:digit:]] ranges = %v", cls.Ranges)
 	}
 }
 
