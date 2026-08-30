@@ -68,14 +68,66 @@ func classify(name string) func(rune) bool {
 	case "Space":
 		return unicode.IsSpace
 	case "Upper":
-		return unicode.IsUpper
+		return isUpper
 	case "Lower":
-		return unicode.IsLower
+		return isLower
 	case "Word":
 		return isWord
+	case "Blank":
+		return isBlank
+	case "Cntrl":
+		return isCntrl
+	case "Graph":
+		return isGraph
+	case "Print":
+		return isPrint
+	case "Punct":
+		return isPunct
 	default:
 		return nil
 	}
+}
+
+// isBlank is Onigmo's Blank alias: a horizontal space — a Unicode space
+// separator (Zs) or a tab. Line/paragraph separators and other whitespace are
+// not blank.
+func isBlank(r rune) bool {
+	return r == '\t' || unicode.Is(unicode.Zs, r)
+}
+
+// isCntrl is Onigmo's Cntrl alias. MRI (ruby 4.0) matches only the Control
+// general category (Cc): format characters (Cf, e.g. U+00AD) are NOT controls,
+// despite the wider wording ("Control | Format | …") in the Onigmo docs.
+func isCntrl(r rune) bool {
+	return unicode.Is(unicode.Cc, r)
+}
+
+// isGraph is Onigmo's Graph alias: an assigned, non-space, non-control code
+// point — every graphic character (letters, marks, numbers, punctuation,
+// symbols) except the space separators, plus the assigned invisible formatting
+// (Cf, e.g. U+00AD) and private-use (Co) code points, which MRI treats as graph.
+// Controls (Cc/Cs) and unassigned code points are excluded.
+func isGraph(r rune) bool {
+	return (unicode.IsGraphic(r) && !unicode.Is(unicode.Z, r)) ||
+		unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Co, r)
+}
+
+// isPrint is Onigmo's Print alias: Graph plus the Unicode space separators (Zs),
+// so an ordinary space and a no-break space print but a tab or newline does not.
+func isPrint(r rune) bool {
+	return isGraph(r) || unicode.Is(unicode.Zs, r)
+}
+
+// isPunct is Onigmo's Punct alias: every Unicode punctuation category (P) plus
+// the nine ASCII characters $ + < = > ^ ` | ~ that Onigmo folds into punct (they
+// are Symbol, not Punctuation, in Unicode). MRI (ruby 4.0) does not treat other
+// symbols (e.g. × or the euro sign) as punct.
+func isPunct(r rune) bool {
+	switch r {
+	case '$', '+', '<', '=', '>', '^', '`', '|', '~':
+		return true
+	}
+	return unicode.IsPunct(r)
 }
 
 // isAlpha is Onigmo's Alpha alias: the Unicode Alphabetic derived property,
@@ -85,11 +137,26 @@ func isAlpha(r rune) bool {
 	return unicode.IsLetter(r) || unicode.Is(unicode.Nl, r) || unicode.Is(unicode.Other_Alphabetic, r)
 }
 
-// isWord is Onigmo's Word alias: a letter, a mark, a decimal number, or a
-// connector punctuation (so the underscore and combining marks are included),
-// matching Ruby's \p{Word}.
+// isWord is Onigmo's Word alias: an alphabetic character, a mark, a decimal
+// number, or a connector punctuation, matching Ruby's \p{Word}. Using the
+// Alphabetic property (isAlpha) rather than bare Letter means letter-numbers
+// such as the Roman numeral Ⅷ (Nl) count as word characters, as MRI treats them.
 func isWord(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsMark(r) || unicode.Is(unicode.Nd, r) || unicode.Is(unicode.Pc, r)
+	return isAlpha(r) || unicode.IsMark(r) || unicode.Is(unicode.Nd, r) || unicode.Is(unicode.Pc, r)
+}
+
+// isUpper is Onigmo's Upper alias: the Unicode Uppercase derived property, which
+// is uppercase letters plus the Other_Uppercase code points (e.g. the uppercase
+// Roman numerals), so it is broader than unicode.IsUpper's Lu-only test.
+func isUpper(r rune) bool {
+	return unicode.IsUpper(r) || unicode.Is(unicode.Other_Uppercase, r)
+}
+
+// isLower is Onigmo's Lower alias: the Unicode Lowercase derived property —
+// lowercase letters plus the Other_Lowercase code points (e.g. the lowercase
+// Roman numerals and modifier letters).
+func isLower(r rune) bool {
+	return unicode.IsLower(r) || unicode.Is(unicode.Other_Lowercase, r)
 }
 
 // Valid reports whether name is a property this engine recognises.

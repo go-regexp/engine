@@ -1493,9 +1493,8 @@ func (p *parser) parsePosixClass(runeAware bool) ([]ast.ClassRange, *ast.PropRef
 
 // posixUnicodeProp maps the POSIX bracket classes that have a full-Unicode
 // definition to the \p{…} property name the charset package recognises, used on
-// a UTF-8 pattern. The remaining classes ([:ascii:], [:blank:], [:cntrl:],
-// [:graph:], [:print:], [:punct:], [:xdigit:]) have no distinct Unicode property
-// here and keep their byte ranges from posixClass.
+// a UTF-8 pattern. Only [:ascii:] (ASCII by definition) and [:xdigit:] (hex
+// digits are always ASCII) keep the byte ranges from posixClass.
 var posixUnicodeProp = map[string]string{
 	"alpha": "Alpha",
 	"alnum": "Alnum",
@@ -1504,6 +1503,11 @@ var posixUnicodeProp = map[string]string{
 	"upper": "Upper",
 	"lower": "Lower",
 	"word":  "Word",
+	"blank": "Blank",
+	"cntrl": "Cntrl",
+	"graph": "Graph",
+	"print": "Print",
+	"punct": "Punct",
 }
 
 // posixClass returns the ASCII byte ranges for a POSIX bracket class name,
