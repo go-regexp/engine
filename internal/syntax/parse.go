@@ -1240,9 +1240,14 @@ func (p *parser) parseClass() (ast.Node, error) {
 		// only inside a character class. It is recognised when the cursor is at a
 		// '[' immediately followed by ':'; otherwise '[' is a literal member.
 		if p.peek() == '[' && p.pos+1 < len(p.src) && p.src[p.pos+1] == ':' {
-			ranges, err := p.parsePosixClass()
+			ranges, prop, err := p.parsePosixClass(runeAware)
 			if err != nil {
 				return nil, err
+			}
+			if prop != nil {
+				// A Unicode-aware POSIX class ([[:alpha:]] on a UTF-8 pattern) is
+				// carried as a \p{…} property, making the whole class rune-aware.
+				cls.Props = append(cls.Props, *prop)
 			}
 			cls.Ranges = append(cls.Ranges, ranges...)
 			continue
@@ -1441,7 +1446,7 @@ func (p *parser) parseClassItem() (byte, []ast.ClassRange, *ast.PropRef, error) 
 // contributes; for the negated form those are the complement, over the full
 // 0..255 byte range, of the positive class — matching Onigmo's byte-oriented
 // behaviour where, e.g., [[:^alpha:]] matches any non-ASCII-letter byte.
-func (p *parser) parsePosixClass() ([]ast.ClassRange, error) {
+func (p *parser) parsePosixClass(runeAware bool) ([]ast.ClassRange, *ast.PropRef, error) {
 	p.next() // consume '['
 	p.next() // consume ':'
 	negate := false
@@ -1455,25 +1460,50 @@ func (p *parser) parsePosixClass() ([]ast.ClassRange, error) {
 		if !(c >= 'a' && c <= 'z') {
 			// POSIX class names are lowercase ASCII letters; anything else means
 			// this is not a well-formed bracket expression.
-			return nil, p.errorf("invalid POSIX bracket name")
+			return nil, nil, p.errorf("invalid POSIX bracket name")
 		}
 		p.next()
 	}
 	// Require the closing ":]".
 	if p.eof() || p.peek() != ':' || p.pos+1 >= len(p.src) || p.src[p.pos+1] != ']' {
-		return nil, p.errorf("premature end of POSIX bracket class")
+		return nil, nil, p.errorf("premature end of POSIX bracket class")
 	}
 	name := p.src[start:p.pos]
 	p.next() // consume ':'
 	p.next() // consume ']'
+	// On a Unicode (UTF-8) pattern the character-property classes match the full
+	// Unicode set — [[:alpha:]] matches "à", [[:digit:]] matches "٠" — exactly as
+	// MRI does. The engine already carries these as \p{…} properties, so emit one
+	// rather than the ASCII byte ranges. In ASCII-8BIT (/n) mode the class stays
+	// byte-oriented (runeAware is false).
+	if runeAware {
+		if prop, ok := posixUnicodeProp[name]; ok {
+			return nil, &ast.PropRef{Name: prop, Negate: negate}, nil
+		}
+	}
 	ranges, ok := posixClass(name)
 	if !ok {
-		return nil, p.errorf("invalid POSIX bracket type [:%s:]", name)
+		return nil, nil, p.errorf("invalid POSIX bracket type [:%s:]", name)
 	}
 	if negate {
-		return negateRanges(ranges), nil
+		return negateRanges(ranges), nil, nil
 	}
-	return ranges, nil
+	return ranges, nil, nil
+}
+
+// posixUnicodeProp maps the POSIX bracket classes that have a full-Unicode
+// definition to the \p{…} property name the charset package recognises, used on
+// a UTF-8 pattern. The remaining classes ([:ascii:], [:blank:], [:cntrl:],
+// [:graph:], [:print:], [:punct:], [:xdigit:]) have no distinct Unicode property
+// here and keep their byte ranges from posixClass.
+var posixUnicodeProp = map[string]string{
+	"alpha": "Alpha",
+	"alnum": "Alnum",
+	"digit": "Digit",
+	"space": "Space",
+	"upper": "Upper",
+	"lower": "Lower",
+	"word":  "Word",
 }
 
 // posixClass returns the ASCII byte ranges for a POSIX bracket class name,
@@ -1504,6 +1534,8 @@ func posixClass(name string) ([]ast.ClassRange, bool) {
 		return []ast.ClassRange{{Lo: ' ', Hi: '~'}}, true
 	case "punct":
 		return []ast.ClassRange{{Lo: '!', Hi: '/'}, {Lo: ':', Hi: '@'}, {Lo: '[', Hi: '`'}, {Lo: '{', Hi: '~'}}, true
+	case "ascii":
+		return []ast.ClassRange{{Lo: 0, Hi: 0x7f}}, true
 	case "xdigit":
 		return []ast.ClassRange{{Lo: '0', Hi: '9'}, {Lo: 'A', Hi: 'F'}, {Lo: 'a', Hi: 'f'}}, true
 	case "word":
