@@ -9,6 +9,7 @@ func TestValid(t *testing.T) {
 		"L", "N", "P", "S", "Z", "C",
 		"Lu", "Ll", "Lt", "Lm", "Lo", "Nd", "Nl", "No", "Cf",
 		"Alpha", "Alnum", "Digit", "Space", "Upper", "Lower", "Word",
+		"Blank", "Cntrl", "Graph", "Print", "Punct",
 	}
 	for _, name := range valid {
 		if !Valid(name) {
@@ -83,7 +84,37 @@ func TestMatch(t *testing.T) {
 		{"Word", false, '_', true},    // connector punctuation
 		{"Word", false, 0x0301, true}, // combining acute (a Mark)
 		{"Word", false, '4', true},
+		{"Word", false, 'Ⅷ', true}, // Nl roman numeral is Alphabetic, so a word char
 		{"Word", false, ' ', false},
+		// Upper/Lower cover the Other_Uppercase / Other_Lowercase code points
+		// (the Roman numerals) that unicode.IsUpper/IsLower (Lu/Ll only) miss.
+		{"Upper", false, 'Ⅷ', true}, // U+2167, Other_Uppercase
+		{"Lower", false, 'ⅷ', true}, // U+2177, Other_Lowercase
+		// Blank: a Unicode space separator or a tab, but not other whitespace.
+		{"Blank", false, '\t', true},
+		{"Blank", false, ' ', true}, // no-break space (Zs)
+		{"Blank", false, '\n', false},
+		// Cntrl: the Control category (Cc) only — a format char is not a control.
+		{"Cntrl", false, '\x00', true},
+		{"Cntrl", false, 0x00AD, false}, // soft hyphen is Cf, not Cc
+		{"Cntrl", false, 'a', false},
+		// Graph: assigned, non-space, non-control — including format/private-use.
+		{"Graph", false, 'a', true},
+		{"Graph", false, 0x00AD, true}, // soft hyphen (Cf) is graph
+		{"Graph", false, ' ', false},
+		{"Graph", false, '\x00', false},
+		{"Graph", false, 0x0378, false}, // unassigned
+		// Print: Graph plus the space separators.
+		{"Print", false, ' ', true},
+		{"Print", false, 'a', true},
+		{"Print", false, '\t', false},
+		{"Print", false, '\x00', false},
+		// Punct: Unicode punctuation plus the nine folded ASCII symbols.
+		{"Punct", false, '!', true},
+		{"Punct", false, '$', true}, // folded ASCII symbol
+		{"Punct", false, '~', true},
+		{"Punct", false, '×', false}, // a Symbol, not punct
+		{"Punct", false, 'a', false},
 		// Negation flips the result.
 		{"L", true, 'é', false},
 		{"L", true, '1', true},
@@ -106,17 +137,17 @@ func TestFoldEqual(t *testing.T) {
 		a, b rune
 		want bool
 	}{
-		{'a', 'a', true},      // identity
-		{'A', 'a', true},      // ASCII case
-		{'a', 'A', true},      // ASCII case, other direction
-		{'É', 'é', true},      // Latin-1 accented pair
-		{'k', 0x212A, true},   // "k" ↔ KELVIN SIGN
-		{'s', 0x017F, true},   // "s" ↔ LATIN SMALL LETTER LONG S
-		{'Σ', 'ς', true},      // Greek sigma orbit member
-		{'ς', 'σ', true},      // and another member of the same orbit
-		{'a', 'b', false},     // different letters never fold-match
-		{'a', '5', false},     // letter vs digit
-		{'é', 'e', false},     // accent is significant (simple folding)
+		{'a', 'a', true},    // identity
+		{'A', 'a', true},    // ASCII case
+		{'a', 'A', true},    // ASCII case, other direction
+		{'É', 'é', true},    // Latin-1 accented pair
+		{'k', 0x212A, true}, // "k" ↔ KELVIN SIGN
+		{'s', 0x017F, true}, // "s" ↔ LATIN SMALL LETTER LONG S
+		{'Σ', 'ς', true},    // Greek sigma orbit member
+		{'ς', 'σ', true},    // and another member of the same orbit
+		{'a', 'b', false},   // different letters never fold-match
+		{'a', '5', false},   // letter vs digit
+		{'é', 'e', false},   // accent is significant (simple folding)
 	} {
 		if got := FoldEqual(tc.a, tc.b); got != tc.want {
 			t.Errorf("FoldEqual(%q,%q) = %v, want %v", tc.a, tc.b, got, tc.want)
