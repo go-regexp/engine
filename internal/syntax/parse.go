@@ -939,6 +939,14 @@ func (p *parser) parseEscape() (ast.Node, error) {
 		return &ast.Literal{B: '\a'}, nil
 	case 'e':
 		return &ast.Literal{B: 0x1b}, nil
+	case 'x':
+		// \xHH — one or two hex digits — is a raw byte (Onigmo/Ruby; there is no
+		// brace \x{…} form in a Ruby regexp, unlike a string literal).
+		hb, err := p.parseHexByte()
+		if err != nil {
+			return nil, err
+		}
+		return &ast.Literal{B: hb}, nil
 	case '1', '2', '3', '4', '5', '6', '7', '8', '9':
 		idx := int(b - '0')
 		for !p.eof() && p.peek() >= '0' && p.peek() <= '9' {
@@ -1210,6 +1218,35 @@ func hexRanges() []ast.ClassRange {
 	return []ast.ClassRange{{Lo: '0', Hi: '9'}, {Lo: 'A', Hi: 'F'}, {Lo: 'a', Hi: 'f'}}
 }
 
+func isHexDigit(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+func hexVal(b byte) byte {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0'
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10
+	default:
+		return b - 'A' + 10
+	}
+}
+
+// parseHexByte reads the one or two hex digits of a \xHH escape (the cursor is
+// just past the 'x') and returns the byte. At least one hex digit is required, as
+// in Onigmo/Ruby, where \x with no hex digit is a syntax error.
+func (p *parser) parseHexByte() (byte, error) {
+	if p.eof() || !isHexDigit(p.peek()) {
+		return 0, p.errorf("invalid hex escape")
+	}
+	v := hexVal(p.next())
+	if !p.eof() && isHexDigit(p.peek()) {
+		v = v*16 + hexVal(p.next())
+	}
+	return v, nil
+}
+
 // parseClass parses a bracketed character class [...].
 func (p *parser) parseClass() (ast.Node, error) {
 	p.next() // consume '['
@@ -1426,6 +1463,13 @@ func (p *parser) parseClassItem() (byte, []ast.ClassRange, *ast.PropRef, error) 
 		return '\a', nil, nil, nil // bell, 0x07
 	case 'e':
 		return 0x1b, nil, nil, nil // escape
+	case 'x':
+		// \xHH — a raw byte — is a valid class member (e.g. /[\x00-\x7f]/).
+		hb, err := p.parseHexByte()
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		return hb, nil, nil, nil
 	case '\\', ']', '[', '^', '-':
 		return e, nil, nil, nil
 	default:

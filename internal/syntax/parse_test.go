@@ -712,3 +712,29 @@ func TestParseInlineFlagErrors(t *testing.T) {
 		}
 	}
 }
+
+// TestParseHexEscape covers the \xHH byte escape, both as a standalone atom and
+// inside a character class, and the required-hex-digit error — matching Onigmo/
+// Ruby, which have no brace \x{…} form in a regexp.
+func TestParseHexEscape(t *testing.T) {
+	for _, src := range []string{`\x41`, `\x0A`, `\x7`, `[\x41\x42]`, `[\x00-\x7f]`, `a\x2Db`} {
+		if _, err := Parse(src); err != nil {
+			t.Errorf("Parse(%q) error: %v", src, err)
+		}
+	}
+	// \x41 is the literal byte 'A'.
+	prog, err := Parse(`\x41`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if lit, ok := prog.Root.(*ast.Literal); !ok || lit.B != 'A' {
+		t.Fatalf(`\x41: expected Literal 'A', got %#v`, prog.Root)
+	}
+	// A \x with no hex digit, or a non-hex digit, is a syntax error — in and out of
+	// a class.
+	for _, bad := range []string{`\x`, `\xg`, `[\xz]`, `[\x]`} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("Parse(%q) succeeded, want an error", bad)
+		}
+	}
+}
