@@ -20,7 +20,11 @@ func (re *Regexp) replaceAll(src string, repl func(dst []byte, match []int) []by
 	searchPos := 0
 	end := len(src)
 	for searchPos <= end {
-		match := re.submatch(src, searchPos)
+		// A search abandoned at a limit (ErrTimeout, ErrBudget) ends the walk with the
+		// replacements made so far, exactly as a genuine non-match does: this family
+		// has no channel to report the difference, which is why a guard must use an
+		// …Err primitive instead (see ErrTimeout).
+		match, _ := re.submatch(src, searchPos)
 		if match == nil {
 			break
 		}
