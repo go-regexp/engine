@@ -79,6 +79,17 @@ Extensions beyond the standard library:
 | `MatchBounds`, `MatchBoundsAt` | allocation-free whole-match `[begin,end)`; `…At` anchors at a byte offset without scanning forward |
 | `FindStringSubmatchIndexAt` | anchored submatch (cursor-style lexing) |
 | `WithTimeout`, `Timeout` | per-match wall-clock limit for pathological patterns |
+| `MatchBoundsErr`, `MatchBoundsAtErr`, `FindStringSubmatchIndexErr`, `FindStringSubmatchIndexAtErr` | the same four primitives, reporting **why** there is no match: `ErrTimeout` or `ErrBudget` when the search was abandoned with the answer still unknown |
+
+> **If you are using a `Regexp` as a guard — a validator, a denylist, an
+> allowlist — use an `…Err` method and treat a non-nil error as a refusal.** The
+> standard-library-shaped methods fold both limits into "no match", so a search
+> abandoned on a crafted subject is indistinguishable from a subject that simply
+> does not match, and the guard reads as "did not fire". That is fail-open, and
+> it is what Ruby's `Regexp::TimeoutError` exists to prevent. Note that
+> `ErrBudget` needs no timeout to be configured: it is reached under
+> `DefaultBudget` on a catastrophically backtracking pattern (`(a+)+\1b` against
+> `"a"*26` is abandoned in ~0.83 s).
 
 `FindAll*` follow the standard library's non-overlapping, left-to-right semantics,
 including empty-match handling (an empty match advances by one rune and an empty
