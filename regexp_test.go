@@ -227,6 +227,18 @@ func TestFindStringSubmatchIndexAt(t *testing.T) {
 	if re.FindStringSubmatchIndexAt("t=09:30", 99) != nil {
 		t.Fatal("pos past len should yield nil")
 	}
+	// A pattern with a literal prefix: the start filter rejects a cursor where the
+	// prefix is absent without running the VM, and lets the right one through.
+	lit := MustCompile(`t=(\d+)`)
+	if lit.FindStringSubmatchIndexAt("xt=1", 0) != nil {
+		t.Fatal("prefix absent at 0: want nil")
+	}
+	if idx := lit.FindStringSubmatchIndexAt("xt=1", 1); !reflect.DeepEqual(idx, []int{1, 4, 3, 4}) {
+		t.Fatalf("prefix present at 1: got %v", idx)
+	}
+	if lit.FindStringSubmatchIndexAt("xt=a", 1) != nil {
+		t.Fatal("prefix present but no digit: the VM must still say no")
+	}
 }
 
 // --- FindAll ---------------------------------------------------------------

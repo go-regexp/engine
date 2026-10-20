@@ -58,6 +58,11 @@ type machine struct {
 	// to when submatches are needed. It is nil when the program is outside the
 	// subset, in which case every match runs on the backtracking VM.
 	dfa *vm.DFA
+	// start rejects, without running a matcher, an anchored match at a position
+	// where the pattern provably cannot begin (wrong first byte, missing literal
+	// prefix, \A past offset 0). A tokenizer tries rule after rule at its cursor
+	// and most of them fail there, so this is where most anchored calls end.
+	start *vm.StartFilter
 }
 
 // build performs the deferred lowering exactly once, lowering the retained parse
@@ -67,6 +72,7 @@ func (m *machine) build() {
 	m.once.Do(func() {
 		m.prog = compile.CompileEnc(m.res, m.enc)
 		m.dfa = vm.BuildDFA(m.prog)
+		m.start = vm.NewStartFilter(m.prog)
 	})
 }
 
@@ -330,6 +336,9 @@ func (re *Regexp) matchBoundsAt(s string, pos int) (begin, end int, ok bool, err
 	}
 	m := re.m
 	m.build()
+	if !m.start.CanStartAt(s, pos) {
+		return 0, 0, false, nil
+	}
 	if m.dfa != nil {
 		b, e, found := m.dfa.MatchAt(s, m.prog.Enc, pos)
 		return b, e, found, nil
@@ -440,6 +449,9 @@ func (re *Regexp) submatchAt(s string, pos int) ([]int, error) {
 	}
 	m := re.m
 	m.build()
+	if !m.start.CanStartAt(s, pos) {
+		return nil, nil
+	}
 	caps, ok, err := vm.MatchTimeoutAt(m.prog, s, pos, vm.DefaultBudget, re.deadline())
 	if err != nil {
 		return nil, err
