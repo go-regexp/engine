@@ -500,6 +500,47 @@ func (pf prefilter) nextStart(input string, from int) int {
 	return from
 }
 
+// canStartAt reports whether a match anchored exactly at pos is still possible
+// under the prefilter's exact necessary conditions: \A pins it to offset 0, a
+// literal prefix must be there, and the byte at pos must be in the first-byte
+// set. It never answers false for a position the VM could match from, so a false
+// lets an anchored caller skip the VM; true says nothing.
+//
+// The required interior literal is deliberately not checked: it would scan the
+// rest of the input on every call, which for a tokenizer matching rule after rule
+// at an advancing cursor is quadratic in the input.
+func (pf prefilter) canStartAt(input string, pos int) bool {
+	if pf.anchored && pos != 0 {
+		return false
+	}
+	if pf.prefix != "" {
+		return strings.HasPrefix(input[pos:], pf.prefix)
+	}
+	if pf.hasFirst {
+		return pos < len(input) && pf.first.has(input[pos])
+	}
+	return true
+}
+
+// StartFilter is a program's precomputed check for a match anchored at a given
+// position (see MatchAt). It is computed once per program and is immutable, so a
+// shared compiled pattern can use it from any goroutine.
+type StartFilter struct {
+	pf prefilter
+}
+
+// NewStartFilter analyses prog once.
+func NewStartFilter(prog *compile.Program) *StartFilter {
+	return &StartFilter{pf: analyze(prog)}
+}
+
+// CanStartAt reports whether a match of the program anchored exactly at byte
+// offset pos (0 <= pos <= len(input)) is possible. False is a proof that
+// MatchAt(prog, input, pos, …) cannot match; true is no promise.
+func (f *StartFilter) CanStartAt(input string, pos int) bool {
+	return f.pf.canStartAt(input, pos)
+}
+
 // usable reports whether the prefilter can actually skip any work. An anchored
 // pattern always can (it collapses the scan to one position). A non-empty
 // literal prefix always can. A first-byte set helps only when it is a proper
