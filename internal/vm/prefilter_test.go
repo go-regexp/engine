@@ -595,7 +595,7 @@ func bruteForce(t *testing.T, prog *compile.Program, input string) (int, int, bo
 	t.Helper()
 	for start := 0; start <= len(input); start++ {
 		m := &machine{prog: prog, input: input, budget: DefaultBudget, memoize: !prog.HasBackref && !prog.HasCall}
-		m.memo.init(len(prog.Insts), len(input), prog.HasSplit)
+		m.memo.init(len(prog.Insts), prog.HasSplit)
 		m.caps = make([]int, prog.NumSlots())
 		res, ok, err := m.run(start)
 		if err != nil {

@@ -179,120 +179,195 @@ type machine struct {
 	// memoize enables the persistent (pc, sp) memo. It is the program's
 	// no-backreference, no-call property, hoisted here for the hot loop.
 	memoize bool
+	// looks holds one reusable frame per lookaround nesting depth (lookDepth is
+	// the number in use), so a lookaround sub-search reuses its memo window and
+	// backtrack stack instead of allocating them on every evaluation.
+	looks     []*lookFrame
+	lookDepth int
 }
 
-// maxDenseMemoCells bounds the (pc × position) table size for which the memo uses
-// a dense []uint32 stamp array. The dense form is the fastest possible memo — a
-// flat array index and compare — but it must allocate nPC*(inputLen+1) cells up
-// front, which for a large haystack is wasteful when only a few positions are
-// actually visited (e.g. an anchored `\A\w+` that matches a short word and stops,
-// or any split pattern that hits early). Above this cap the memo falls back to a
-// generation-stamped map that grows only to the positions truly touched. The cap
-// (~256 K cells = 1 MB) comfortably covers every catastrophic-backtracking case,
-// whose inputs are short (the canonical ReDoS strings are tens of bytes), so the
-// ReDoS-defusing memo always stays on the fast dense path; only split patterns
-// over large haystacks — where the visited-position set is far smaller than the
-// full table — take the sparse path and so skip the multi-megabyte allocation.
+// lookFrame is the reusable state of one lookaround sub-search: its own (pc, sp)
+// memo and its own backtrack stack backing.
+type lookFrame struct {
+	memo  memoGen
+	stack []thread
+}
+
+// maxDenseMemoCells bounds the dense (position × pc) window of the memo. The
+// dense form is the fastest possible memo — a flat array index and compare — and
+// the window covers only the positions an attempt has actually reached, so a
+// cursor-anchored token match over a long buffer touches a few rows, not the whole
+// haystack. A window that would grow past this cap (a split pattern that wanders
+// far from its start) moves its live marks to a generation-stamped map that holds
+// only the cells truly set. The cap (256 K cells = 1 MiB) comfortably covers every
+// catastrophic-backtracking case, whose inputs are short (the canonical ReDoS
+// strings are tens of bytes), so the ReDoS-defusing memo stays on the dense path.
 const maxDenseMemoCells = 1 << 18
 
-// memoGen is a generation-stamped memo over (pc, sp) decision points, replacing
-// the old map[int64]bool. A cell is "marked" iff its stored stamp equals the
-// current generation cur, so clearing the whole set is O(1): bumping cur
-// invalidates every stamp at once. That makes the per-start and per-consumed-byte
-// resets free — a length-of-input dense bitset zeroed in full would turn a long
-// no-split scan into O(n²); the generation bump avoids it.
+// minDenseMemoRows is the number of positions the first dense allocation covers,
+// so a typical short token match grows its window at most once or twice.
+const minDenseMemoRows = 16
+
+// maxRetainedLookFrames is how many lookaround frames (sub-search memo and stack)
+// a pooled machine keeps across calls; deeper frames, only reached by nested or
+// recursive lookarounds, are dropped at release so an idle machine stays small.
+const maxRetainedLookFrames = 4
+
+// memoGen is a generation-stamped memo over (pc, sp) decision points. A cell is
+// "marked" iff its stored stamp equals the current generation cur, so clearing
+// the whole set is O(1): bumping cur invalidates every stamp at once. That makes
+// the per-start and per-consumed-byte resets free — a dense bitset zeroed in full
+// would turn a long no-split scan into O(n²); the generation bump avoids it.
 //
-// It has two backings chosen by table size at init (see maxDenseMemoCells): a
-// dense []uint32 stamp array (fastest: a flat index and compare) for small tables,
-// or a generation-stamped map[int64]uint32 that grows only to the visited
-// positions for large haystacks, so a split pattern over a big input does not pay
-// a multi-megabyte up-front allocation. Either way it preserves the exact
-// linear-time ReDoS guarantee of the old memo: a (pc, sp) reached a second time
-// within the memo's validity window (one whole attempt when memoization is on,
-// since the last consumed byte when off) is pruned identically.
+// The dense backing is position-major, cell (sp-base)*nPC + pc, and covers only
+// the rows [base, base+rows) an attempt has reached so far: it starts empty at
+// each attempt (reset) and grows geometrically as set() reaches new positions,
+// keeping its backing across attempts and across pooled calls. Allocation is thus
+// proportional to how far a match explores, not to the length of the haystack —
+// the difference between a few hundred bytes and a megabyte per token when a
+// tokenizer matches at a cursor inside a long buffer (go-regexp/engine#10). Past
+// maxDenseMemoCells, or for a position before base, the live marks move to a
+// generation-stamped map[int64]uint32 for the rest of the attempt.
+//
+// Either way it preserves the exact linear-time ReDoS guarantee: a (pc, sp)
+// reached a second time within the memo's validity window (one whole attempt when
+// memoization is on, since the last consumed byte when off) is pruned
+// identically. Stale cells — in the dense backing past rows, or left over from a
+// previous attempt, program or pooled call — always hold a stamp below cur, which
+// is why growth needs no clearing.
 type memoGen struct {
-	gen    []uint32         // dense backing (nil when the sparse map is used)
-	sparse map[int64]uint32 // sparse backing (nil when the dense array is used)
+	gen    []uint32         // dense backing; len(gen) == rows*nPC
+	sparse map[int64]uint32 // sparse backing, used only when sparseOn
 	cur    uint32
-	stride int  // len(input)+1
+	nPC    int
+	base   int  // input position of row 0
+	rows   int  // positions covered by gen
 	active bool // false when the program has no OpSplit, so the memo is never used
+	// sparseOn is set when this attempt outgrew the dense window; reset clears it.
+	sparseOn bool
 }
 
-// init prepares the memo for nPC instructions over an input of length inputLen
-// when hasSplit is true; otherwise it leaves the memo inactive and allocates
-// nothing (a split-free program never reaches test/set). It picks the dense or
-// sparse backing by table size and reuses the existing backing across calls when
-// possible.
-func (b *memoGen) init(nPC, inputLen int, hasSplit bool) {
+// init prepares the memo for a program of nPC instructions when hasSplit is true;
+// otherwise it leaves the memo inactive and allocates nothing (a split-free
+// program never reaches test/set). It allocates nothing either way: the dense
+// window grows on demand, reusing the backing a pooled machine already holds.
+func (b *memoGen) init(nPC int, hasSplit bool) {
 	b.active = hasSplit
 	if !hasSplit {
 		return
 	}
-	b.stride = inputLen + 1
-	n := nPC * b.stride
-	if n <= maxDenseMemoCells {
-		b.sparse = nil
-		if cap(b.gen) >= n {
-			b.gen = b.gen[:n]
-		} else {
-			b.gen = make([]uint32, n)
-			b.cur = 0
-		}
-	} else {
-		// Large table: a sparse map that grows only to visited positions, avoiding
-		// the multi-megabyte dense allocation. Reuse an existing map; the generation
-		// stamp lets stale entries expire without clearing it.
-		b.gen = nil
-		if b.sparse == nil {
-			b.sparse = make(map[int64]uint32)
-			b.cur = 0
-		}
+	b.nPC = nPC
+	b.reset(0)
+}
+
+// reset forgets every mark and rebases the dense window at position base, in
+// O(1): the generation bump makes every existing stamp stale, so the backing is
+// reused as it is. Each attempt (a start position, a lookaround sub-search) calls
+// it with its own starting position.
+func (b *memoGen) reset(base int) {
+	if !b.active {
+		return
 	}
-	// Start at generation 1 so a freshly made (all-zero) dense slice has no cell
-	// accidentally matching the current generation.
 	b.bump()
+	b.base = base
+	b.sparseOn = false
+	b.gen = b.gen[:cap(b.gen)]
+	b.rows = len(b.gen) / b.nPC
+	b.gen = b.gen[:b.rows*b.nPC]
 }
 
 // bump advances to a fresh generation, invalidating every previously-set stamp in
-// O(1). On the rare wraparound back to 0 it resets the backing (zeroing the dense
-// slice or recreating the map) and restarts at 1, so a stale stamp can never
-// collide with the live generation.
+// O(1). On the rare wraparound back to 0 it zeroes the whole backing (up to its
+// capacity, since growth reslices into it without clearing) and the map, and
+// restarts at 1, so a stale stamp can never collide with the live generation.
 func (b *memoGen) bump() {
 	b.cur++
 	if b.cur == 0 {
-		if b.gen != nil {
-			clear(b.gen)
-		} else {
-			clear(b.sparse)
-		}
+		clear(b.gen[:cap(b.gen)])
+		clear(b.sparse)
 		b.cur = 1
 	}
 }
 
-// clearAll forgets every marked (pc, sp) in O(1) (used per start position, and on
-// every consumed byte when memoization is disabled so the set only guards
-// empty-width loops since the last advance).
+// clearAll forgets every marked (pc, sp) in O(1) (used on every consumed byte
+// when memoization is disabled so the set only guards empty-width loops since the
+// last advance). The window keeps its base.
 func (b *memoGen) clearAll() {
 	if b.active {
 		b.bump()
 	}
 }
 
+// key is the sparse map key of (pc, sp), computed in 64 bits so it cannot
+// overflow on a 32-bit target.
+func (b *memoGen) key(pc, sp int) int64 {
+	return int64(sp)*int64(b.nPC) + int64(pc)
+}
+
 // test reports whether (pc, sp) is marked in the current generation.
 func (b *memoGen) test(pc, sp int) bool {
-	if b.gen != nil {
-		return b.gen[pc*b.stride+sp] == b.cur
+	if b.sparseOn {
+		return b.sparse[b.key(pc, sp)] == b.cur
 	}
-	return b.sparse[int64(pc)*int64(b.stride)+int64(sp)] == b.cur
+	// rel < rows bounds the index below len(gen), so rel*nPC+pc cannot overflow.
+	if rel := sp - b.base; uint(rel) < uint(b.rows) {
+		return b.gen[rel*b.nPC+pc] == b.cur
+	}
+	return false
 }
 
 // set marks (pc, sp) in the current generation.
 func (b *memoGen) set(pc, sp int) {
-	if b.gen != nil {
-		b.gen[pc*b.stride+sp] = b.cur
+	if !b.sparseOn {
+		if rel := sp - b.base; uint(rel) < uint(b.rows) {
+			b.gen[rel*b.nPC+pc] = b.cur
+			return
+		}
+		if !b.grow(sp) {
+			b.toSparse()
+		}
+	}
+	if b.sparseOn {
+		b.sparse[b.key(pc, sp)] = b.cur
 		return
 	}
-	b.sparse[int64(pc)*int64(b.stride)+int64(sp)] = b.cur
+	b.gen[(sp-b.base)*b.nPC+pc] = b.cur
+}
+
+// grow extends the dense window to cover position sp, doubling the backing when
+// it must reallocate, and reports false when sp lies before base or the window
+// would exceed maxDenseMemoCells.
+func (b *memoGen) grow(sp int) bool {
+	rel := sp - b.base
+	maxRows := maxDenseMemoCells / b.nPC
+	if rel < 0 || rel >= maxRows {
+		return false
+	}
+	need := rel + 1
+	if need*b.nPC > cap(b.gen) {
+		rows := max(need, 2*b.rows, minDenseMemoRows)
+		rows = min(rows, maxRows)
+		g := make([]uint32, rows*b.nPC)
+		copy(g, b.gen)
+		b.gen = g
+	}
+	b.rows = cap(b.gen) / b.nPC
+	b.gen = b.gen[:b.rows*b.nPC]
+	return true
+}
+
+// toSparse moves the live marks of the dense window into the map and switches
+// the rest of the attempt to it.
+func (b *memoGen) toSparse() {
+	if b.sparse == nil {
+		b.sparse = make(map[int64]uint32)
+	}
+	for i, s := range b.gen {
+		if s == b.cur {
+			b.sparse[b.key(i%b.nPC, b.base+i/b.nPC)] = b.cur
+		}
+	}
+	b.sparseOn = true
 }
 
 // Match runs prog against input, scanning start positions left to right until a
@@ -351,7 +426,8 @@ func acquireMachine(prog *compile.Program, input string, budget int, deadline ti
 	// (\g<…>) carries its own recursion state, so either disables memoization; the
 	// step budget then bounds the work.
 	m.memoize = !prog.HasBackref && !prog.HasCall
-	m.memo.init(len(prog.Insts), len(input), prog.HasSplit)
+	m.memo.init(len(prog.Insts), prog.HasSplit)
+	m.lookDepth = 0
 	// Size caps to the program's slot count, reusing the pooled backing when it is
 	// large enough. run() fills it with -1 before matching, so no clearing here.
 	if ns := prog.NumSlots(); cap(m.caps) >= ns {
@@ -368,6 +444,10 @@ func releaseMachine(m *machine) {
 	m.prog = nil
 	m.input = ""
 	m.deadline = time.Time{}
+	if len(m.looks) > maxRetainedLookFrames {
+		clear(m.looks[maxRetainedLookFrames:])
+		m.looks = m.looks[:maxRetainedLookFrames]
+	}
 	machinePool.Put(m)
 }
 
@@ -476,8 +556,10 @@ func (m *machine) run(start int) ([]int, bool, error) {
 	// A fresh search starts from an empty memo. Each start position is an
 	// independent attempt; a (pc, sp) that failed from an earlier start could in
 	// principle be re-reached, but the memo is reset per start to keep its meaning
-	// simple (failure of this whole attempt) and bounded.
-	m.memo.clearAll()
+	// simple (failure of this whole attempt) and bounded. Its dense window is
+	// rebased at start, where this attempt's positions begin.
+	m.memo.reset(start)
+	m.lookDepth = 0
 	pc := 0
 	sp := start
 	for {
@@ -886,6 +968,21 @@ func (m *machine) look(lookPC int, in compile.Inst, sp int) (bool, error) {
 // positive lookaround exposes its captures); on failure they are rewound here so
 // the outer search sees no change.
 func (m *machine) execLook(body, sp, endAt int, keep bool) (bool, error) {
+	// Each nesting depth owns one reusable frame (memo window and stack backing),
+	// so a lookaround evaluated at every position of a scan allocates nothing once
+	// its frame has grown to the size it needs.
+	if m.lookDepth == len(m.looks) {
+		m.looks = append(m.looks, new(lookFrame))
+	}
+	lf := m.looks[m.lookDepth]
+	m.lookDepth++
+	ok, err := m.execLookIn(lf, body, sp, endAt, keep)
+	m.lookDepth--
+	return ok, err
+}
+
+// execLookIn is execLook's sub-search, run in the frame lf.
+func (m *machine) execLookIn(lf *lookFrame, body, sp, endAt int, keep bool) (bool, error) {
 	// A lookaround sub-search runs against an isolated backtrack stack and memo so
 	// it cannot disturb the outer search, but it shares m.caps / m.trail so a
 	// positive lookaround's captures can survive into the outer match. The outer
@@ -897,14 +994,21 @@ func (m *machine) execLook(body, sp, endAt int, keep bool) (bool, error) {
 	savedCallLen := len(m.calls)
 	savedOpenLen := len(m.openg)
 	savedAtomicLen := len(m.atomic)
-	m.stack = nil
-	var subMemo memoGen
-	subMemo.init(len(m.prog.Insts), len(m.input), m.prog.HasSplit)
+	m.stack = lf.stack[:0]
+	subMemo := &lf.memo
+	subMemo.init(len(m.prog.Insts), m.prog.HasSplit)
+	subMemo.reset(sp)
 	pc := body
+	restoreStack := func() {
+		// Keep the sub-search's (possibly grown) stack backing for the next
+		// evaluation at this depth, and give the outer search its stack back.
+		lf.stack = m.stack[:0]
+		m.stack = savedStack
+	}
 	fail := func() {
 		// Restore the outer search's backtrack stack and rewind any capture / stack
 		// mutations the sub-search made.
-		m.stack = savedStack
+		restoreStack()
 		m.rewind(savedTrailLen)
 		m.calls = m.calls[:savedCallLen]
 		m.openg = m.openg[:savedOpenLen]
@@ -912,7 +1016,7 @@ func (m *machine) execLook(body, sp, endAt int, keep bool) (bool, error) {
 	}
 	for {
 		if err := m.tick(); err != nil {
-			m.stack = savedStack
+			restoreStack()
 			return false, err
 		}
 
@@ -1043,7 +1147,7 @@ func (m *machine) execLook(body, sp, endAt int, keep bool) (bool, error) {
 		case compile.OpLook:
 			matched, err := m.look(pc, in, sp)
 			if err != nil {
-				m.stack = savedStack
+				restoreStack()
 				return false, err
 			}
 			if matched != in.Negate {
@@ -1090,7 +1194,7 @@ func (m *machine) execLook(body, sp, endAt int, keep bool) (bool, error) {
 				// assertion will FAIL at the caller, and it must leave no capture
 				// trace, so rewind the trail and restore the stacks now.
 				if keep {
-					m.stack = savedStack
+					restoreStack()
 				} else {
 					fail()
 				}
