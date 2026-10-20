@@ -98,6 +98,14 @@ match adjacent to a previous match is skipped).
 A `*Regexp` is immutable once compiled and safe for concurrent use by multiple
 goroutines. The heavy matcher state is built lazily on the first match.
 
+Matching state is pooled and sized by how far a match explores, not by the length
+of the input: the backtracking VM's (instruction, position) memo covers only the
+positions an attempt reaches, and lookarounds reuse one frame per nesting depth.
+A tokenizer that calls `FindStringSubmatchIndexAt` at a cursor inside a long
+buffer therefore allocates little more than the capture slice it gets back (on
+go-slides' 100-slide benchmark deck, highlighted by go-rouge, a render went from
+52 MB to 11 MB allocated).
+
 ## Status
 
 Engine and public API are complete with **100% test coverage** and CI on the six

@@ -92,54 +92,99 @@ func TestFusedLoopBudget(t *testing.T) {
 }
 
 // TestMemoGenSparseBacking exercises the sparse-map backing of the (pc, sp) memo,
-// chosen when the (instruction count × input length) table would exceed the dense
-// cap. It drives test/set/clearAll on the sparse path directly.
+// taken when the dense window would grow past the cap or reach a position before
+// its base. It drives test/set/clearAll on the sparse path directly, and checks
+// that the marks already in the dense window move with the switch.
 func TestMemoGenSparseBacking(t *testing.T) {
 	var b memoGen
-	// nPC * (inputLen+1) > maxDenseMemoCells forces the sparse map.
-	b.init(1024, maxDenseMemoCells, true)
-	if b.gen != nil || b.sparse == nil {
-		t.Fatal("oversized table must use the sparse map backing")
+	b.init(1024, true)
+	b.reset(10)
+	b.set(4, 10) // dense, row 0
+	if b.sparseOn {
+		t.Fatal("a mark at base must stay in the dense window")
+	}
+	far := 10 + maxDenseMemoCells/1024 // first row past the cap
+	b.set(3, far)
+	if !b.sparseOn {
+		t.Fatal("a mark past the dense cap must switch to the sparse map")
+	}
+	if !b.test(4, 10) || !b.test(3, far) {
+		t.Fatal("marks must survive the switch to the sparse map")
 	}
 	if b.test(3, 7) {
 		t.Fatal("unset (3,7) must not be marked")
 	}
-	b.set(3, 7)
-	if !b.test(3, 7) {
-		t.Fatal("set (3,7) must be marked")
-	}
 	b.clearAll()
-	if b.test(3, 7) {
-		t.Fatal("clearAll must forget the mark")
+	if b.test(3, far) || b.test(4, 10) {
+		t.Fatal("clearAll must forget the marks")
 	}
-	// Re-init reuses the existing sparse map rather than allocating a new one.
-	b.set(5, 5)
-	b.init(1024, maxDenseMemoCells, true)
-	if b.gen != nil || b.sparse == nil {
-		t.Fatal("re-init must keep the sparse backing")
+	// A position before the base also takes the sparse path.
+	b.reset(10)
+	if b.sparseOn {
+		t.Fatal("reset must return to the dense window")
+	}
+	b.set(2, 5)
+	if !b.sparseOn || !b.test(2, 5) || b.test(2, 6) {
+		t.Fatal("a mark before base must be kept in the sparse map")
 	}
 }
 
-// TestMemoGenDenseReuse exercises the dense-backing reuse path: a second init
-// whose table fits the already-allocated slice reuses it rather than reallocating.
+// TestMemoGenDenseReuse exercises the dense-backing reuse path: the window grows
+// on demand, and a later init/reset reuses the backing rather than reallocating,
+// whatever the program size and the base.
 func TestMemoGenDenseReuse(t *testing.T) {
 	var b memoGen
-	b.init(16, 16, true) // small dense table
-	if b.gen == nil {
-		t.Fatal("small table must use the dense backing")
+	b.init(16, true)
+	if b.gen != nil || b.rows != 0 {
+		t.Fatal("init must allocate nothing")
 	}
-	first := &b.gen[0]
-	b.init(8, 8, true) // smaller: cap(b.gen) >= n, reuse
-	if &b.gen[0] != first {
+	b.set(5, 3)
+	if b.gen == nil || !b.test(5, 3) {
+		t.Fatal("set must grow the dense window and mark the cell")
+	}
+	first := &b.gen[:1][0]
+	b.init(8, true)
+	b.reset(1000)
+	if b.test(5, 3) || b.test(5, 1003) {
+		t.Fatal("re-init must forget earlier marks")
+	}
+	b.set(7, 1000)
+	if &b.gen[:1][0] != first || !b.test(7, 1000) {
 		t.Fatal("a fitting re-init must reuse the dense slice")
+	}
+	// Growing keeps the marks already set.
+	b.set(1, 1000+10*minDenseMemoRows)
+	if !b.test(7, 1000) || !b.test(1, 1000+10*minDenseMemoRows) {
+		t.Fatal("growth must keep the live marks")
 	}
 	// An inactive (no-split) program leaves the memo untouched and allocates nothing.
 	var c memoGen
-	c.init(10, 10, false)
+	c.init(10, false)
 	if c.active {
 		t.Fatal("a split-free program must leave the memo inactive")
 	}
 	c.clearAll() // no-op on an inactive memo
+	c.reset(3)   // no-op too
+}
+
+// TestMemoGenStaleCellsPastRows checks that cells beyond the window reused from
+// an earlier, larger attempt never read as marked: they hold old stamps.
+func TestMemoGenStaleCellsPastRows(t *testing.T) {
+	var b memoGen
+	b.init(4, true)
+	b.reset(0)
+	for sp := range 100 {
+		b.set(sp%4, sp)
+	}
+	b.init(3, true) // different program: same backing, new layout
+	b.reset(0)
+	for sp := range 100 {
+		for pc := range 3 {
+			if b.test(pc, sp) {
+				t.Fatalf("stale cell (%d,%d) read as marked", pc, sp)
+			}
+		}
+	}
 }
 
 // TestMemoGenBumpWraparound forces the generation counter to wrap to zero, on both
@@ -149,8 +194,9 @@ func TestMemoGenBumpWraparound(t *testing.T) {
 	// Dense: mark a cell at a generation, then wrap. After wrap the old stamp must
 	// no longer read as marked.
 	var d memoGen
-	d.init(4, 4, true)
+	d.init(4, true)
 	d.set(1, 1)
+	d.set(1, 200) // grow, so cells past the first window exist in the backing
 	// Drive the live stamp up to the wrap boundary, then bump: cur++ overflows to 0,
 	// which triggers the reset (clear the slice) and restart at generation 1. The
 	// stale mark written above (at the old high generation) must not survive the
@@ -160,13 +206,20 @@ func TestMemoGenBumpWraparound(t *testing.T) {
 	if d.cur != 1 {
 		t.Fatalf("dense wrap must restart at generation 1, got %d", d.cur)
 	}
-	if d.test(1, 1) {
+	if d.test(1, 1) || d.test(1, 200) {
 		t.Fatal("dense wrap must clear the stale mark")
+	}
+	// The whole backing was zeroed, up to its capacity: no cell holds stamp 1.
+	for i, s := range d.gen[:cap(d.gen)] {
+		if s != 0 {
+			t.Fatalf("dense wrap left cell %d = %d", i, s)
+		}
 	}
 
 	// Sparse: same, on the map backing.
 	var s memoGen
-	s.init(1024, maxDenseMemoCells, true)
+	s.init(1024, true)
+	s.set(2, maxDenseMemoCells) // past the dense cap: sparse
 	s.set(2, 2)
 	s.cur = ^uint32(0)
 	s.bump()

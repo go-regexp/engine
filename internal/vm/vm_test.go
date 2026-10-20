@@ -11,7 +11,7 @@ import (
 )
 
 // build parses, compiles, and returns a program for testing.
-func build(t *testing.T, pat string) *compile.Program {
+func build(t testing.TB, pat string) *compile.Program {
 	t.Helper()
 	r, err := syntax.Parse(pat)
 	if err != nil {
