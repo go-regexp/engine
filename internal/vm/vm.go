@@ -95,11 +95,15 @@ const (
 // trail replaces the old per-thread copy of every snapshot: a thread now stores
 // only the trail length at the moment it was forked, and on backtrack the trail
 // is replayed in reverse down to that mark.
+//
+// An entry is 16 bytes. It used to embed the callFrame itself (64 bytes), so a
+// loop around a capture group paid 64 bytes of trail for every capture write on
+// every iteration -- 1 MiB of `'(\\.|.)*?'` allocated ~900 MB. The frame a
+// trailCallPop restores now lives in machine.frames and val is its index.
 type trailEntry struct {
-	kind  trailKind
-	slot  int // trailCap: capture slot; trailOpenPop: group index restored
-	val   int // trailCap: previous capture value; *Pop: stack value restored
-	frame callFrame
+	kind trailKind
+	slot int32 // trailCap: capture slot; trailOpenPop: group index restored
+	val  int   // trailCap: previous capture value; *Pop: stack value restored; trailCallPop: index into machine.frames
 }
 
 // threadKind distinguishes an ordinary backtrack alternative from a fused-loop
@@ -155,6 +159,8 @@ type machine struct {
 	// trail records reversible mutations (see trailEntry) so a backtrack can
 	// restore caps and the call/open/atomic stacks without per-thread copies.
 	trail []trailEntry
+	// frames holds the call frames trailCallPop entries restore (see trailEntry).
+	frames []callFrame
 	// calls/openg/atomic are the live mutable stacks the trail rewinds. calls holds
 	// pending subexpression-call return frames; openg the indices of currently-open
 	// capture groups (for call save/restore); atomic the backtrack-stack depths
@@ -546,6 +552,7 @@ func MatchTimeoutFrom(prog *compile.Program, input string, from, budget int, dea
 func (m *machine) run(start int) ([]int, bool, error) {
 	m.stack = m.stack[:0]
 	m.trail = m.trail[:0]
+	m.frames = m.frames[:0]
 	m.calls = m.calls[:0]
 	m.openg = m.openg[:0]
 	m.atomic = m.atomic[:0]
@@ -918,7 +925,7 @@ func (m *machine) rewind(mark int) {
 		case trailCallPush:
 			m.calls = m.calls[:len(m.calls)-1]
 		case trailCallPop:
-			m.calls = append(m.calls, e.frame)
+			m.calls = append(m.calls, m.frames[e.val])
 		}
 	}
 	m.trail = m.trail[:mark]
@@ -1248,7 +1255,7 @@ func (m *machine) consumed() {
 // pos in place. The trail entry lets a backtrack restore the old value without
 // the per-save array copy the engine used before.
 func (m *machine) saveSlot(slot, pos int) {
-	m.trail = append(m.trail, trailEntry{kind: trailCap, slot: slot, val: m.caps[slot]})
+	m.trail = append(m.trail, trailEntry{kind: trailCap, slot: int32(slot), val: m.caps[slot]})
 	m.caps[slot] = pos
 }
 
@@ -1270,7 +1277,8 @@ func (m *machine) popCall() callFrame {
 	n := len(m.calls) - 1
 	f := m.calls[n]
 	m.calls = m.calls[:n]
-	m.trail = append(m.trail, trailEntry{kind: trailCallPop, frame: f})
+	m.frames = append(m.frames, f)
+	m.trail = append(m.trail, trailEntry{kind: trailCallPop, val: len(m.frames) - 1})
 	return f
 }
 
