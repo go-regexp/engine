@@ -50,7 +50,9 @@ type machine struct {
 	once sync.Once
 	res  syntax.Result // parsed AST + capture metadata, retained for the deferred lowering
 	enc  compile.Encoding
-	prog *compile.Program
+	// stackLimit is copied into the program at build (see WithStackLimit).
+	stackLimit int
+	prog       *compile.Program
 	// dfa is the lazy-NFA accelerator for the matchable subset (no backreference,
 	// call, lookaround, atomic group, or over-large bounded loop). It finds the
 	// leftmost-first whole-match span in linear time, replacing the backtracking VM
@@ -71,6 +73,7 @@ type machine struct {
 func (m *machine) build() {
 	m.once.Do(func() {
 		m.prog = compile.CompileEnc(m.res, m.enc)
+		m.prog.StackLimit = m.stackLimit
 		m.dfa = vm.BuildDFA(m.prog)
 		m.start = vm.NewStartFilter(m.prog)
 	})
@@ -94,6 +97,9 @@ func (m *machine) build() {
 var (
 	ErrTimeout = vm.ErrTimeout
 	ErrBudget  = vm.ErrBudget
+	// ErrStackLimit is the refusal WithStackLimit asks for: the backtrack state of
+	// the match outgrew the limit. errors.Is(err, ErrBudget) is also true.
+	ErrStackLimit = vm.ErrStackLimit
 )
 
 // Regexp is a compiled regular expression, safe for concurrent use by multiple
@@ -191,6 +197,25 @@ func (re *Regexp) WithTimeout(d time.Duration) *Regexp {
 	} else {
 		cp.timeout = d
 	}
+	return &cp
+}
+
+// WithStackLimit returns a copy of the Regexp that abandons any single match
+// whose backtrack state -- the alternatives it has left open plus the capture
+// undo-log -- would exceed n bytes, reporting ErrStackLimit (which wraps
+// ErrBudget) from the …Err match methods. It is never reported as "no match" by
+// them: a refusal is distinguishable from a failed match. A non-positive n means
+// unlimited, which is the default, as in Onigmo (onig_set_match_stack_limit_size:
+// "size = 0: unlimited"; its error is ONIGERR_MATCH_STACK_LIMIT_OVER).
+//
+// The limit counts the engine's backtrack stack and trail only, not the memo
+// table, and a growing slice may briefly hold up to twice what it counts. Without
+// it a loop around a capture group over a long input uses ~420 bytes per input
+// byte. The copy has its own compiled program (the limit lives in it), built on
+// first use.
+func (re *Regexp) WithStackLimit(n int) *Regexp {
+	cp := *re
+	cp.m = &machine{res: re.m.res, enc: re.m.enc, stackLimit: max(n, 0)}
 	return &cp
 }
 
