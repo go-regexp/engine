@@ -239,6 +239,10 @@ type Program struct {
 	// the memo allocated at all; the VM uses this to skip that allocation and its
 	// per-position reset, which on a long no-split scan would otherwise be O(n²).
 	HasSplit bool
+	// StackLimit, when positive, caps the bytes of backtrack state (alternatives
+	// plus the capture undo-trail) a match may hold; vm.ErrStackLimit past it. Zero
+	// is unlimited, as in Onigmo (onig_set_match_stack_limit_size: 0 == unlimited).
+	StackLimit int
 	// Enc is the input encoding (UTF8 by default, ASCII8BIT for binary /n). It
 	// governs how the dot and byte-oriented classes advance: by a whole code
 	// point in UTF8 mode, by one byte in ASCII8BIT mode.

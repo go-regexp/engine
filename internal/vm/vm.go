@@ -4,9 +4,11 @@ package vm
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/go-regexp/engine/internal/charset"
 	"github.com/go-regexp/engine/internal/compile"
@@ -15,6 +17,18 @@ import (
 // ErrBudget is returned when a match exceeds the configured backtrack-step
 // budget. It is the deterministic hook later phases use for ReDoS hardening.
 var ErrBudget = errors.New("backtrack step budget exceeded")
+
+// ErrStackLimit is returned when a match's backtrack state outgrows the limit set
+// with Regexp.WithStackLimit -- Onigmo's ONIGERR_MATCH_STACK_LIMIT_OVER. It wraps
+// ErrBudget, so a caller that already refuses on ErrBudget refuses on this too,
+// and errors.Is(err, ErrStackLimit) tells the two apart. It is never folded into
+// "no match" by the …Err methods.
+var ErrStackLimit = fmt.Errorf("backtrack stack limit exceeded: %w", ErrBudget)
+
+const (
+	threadBytes = int(unsafe.Sizeof(thread{}))
+	trailBytes  = int(unsafe.Sizeof(trailEntry{}))
+)
 
 // ErrTimeout is returned when a match exceeds the configured wall-clock deadline
 // (Ruby's Regexp.timeout equivalent). It is the real-time backstop that
@@ -159,6 +173,8 @@ type machine struct {
 	// trail records reversible mutations (see trailEntry) so a backtrack can
 	// restore caps and the call/open/atomic stacks without per-thread copies.
 	trail []trailEntry
+	// stackLimit caps the bytes of stack+trail (0 == unlimited); see ErrStackLimit.
+	stackLimit int
 	// frames holds the call frames trailCallPop entries restore (see trailEntry).
 	frames []callFrame
 	// calls/openg/atomic are the live mutable stacks the trail rewinds. calls holds
@@ -424,6 +440,7 @@ func acquireMachine(prog *compile.Program, input string, budget int, deadline ti
 	m.prog = prog
 	m.input = input
 	m.budget = budget
+	m.stackLimit = prog.StackLimit
 	m.deadline = deadline
 	m.clockTick = 0
 	m.gpos = 0
@@ -1232,6 +1249,9 @@ func (m *machine) tick() error {
 		return ErrBudget
 	}
 	m.budget--
+	if m.stackLimit > 0 && len(m.stack)*threadBytes+len(m.trail)*trailBytes > m.stackLimit {
+		return ErrStackLimit
+	}
 	if !m.deadline.IsZero() {
 		m.clockTick++
 		if m.clockTick&clockCheckMask == 0 && time.Now().After(m.deadline) {
