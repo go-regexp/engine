@@ -1301,6 +1301,13 @@ func (p *parser) parseClass() (ast.Node, error) {
 			}
 			continue
 		}
+		// \D \W \S \H inside a class complement their set over BYTES (see
+		// negateRanges), which is the whole story only for a byte-oriented class.
+		// In a UTF-8 class they must also take every code point above 0xFF: the
+		// byte complement stops at U+00FF, so [^\S\n] used to accept "π" (U+03C0)
+		// as whitespace, and [\S] refused it.
+		highToo := p.enc == UTF8 && !cls.Fold && p.pos+1 < len(p.src) &&
+			p.src[p.pos] == '\\' && isNegatedEscape(p.src[p.pos+1])
 		lo, sub, prop, err := p.parseClassItem()
 		if err != nil {
 			return nil, err
@@ -1313,6 +1320,9 @@ func (p *parser) parseClass() (ast.Node, error) {
 		if sub != nil {
 			// A class escape such as \d expands to ranges directly.
 			cls.Ranges = append(cls.Ranges, sub...)
+			if highToo {
+				cls.RuneRanges = append(cls.RuneRanges, ast.RuneClassRange{Lo: 0x100, Hi: unicode.MaxRune})
+			}
 			continue
 		}
 		// Possible range lo-hi. Here lo is always an ASCII byte: a multi-byte low
@@ -1357,6 +1367,12 @@ func (p *parser) parseClass() (ast.Node, error) {
 		}
 		cls.Ranges = append(cls.Ranges, ast.ClassRange{Lo: lo, Hi: lo})
 	}
+}
+
+// isNegatedEscape reports whether b, the letter after a backslash, names a
+// complemented class escape: \D, \W, \S or \H.
+func isNegatedEscape(b byte) bool {
+	return b == 'D' || b == 'W' || b == 'S' || b == 'H'
 }
 
 // parseRuneMember parses one multi-byte code-point member (or the low bound of a
