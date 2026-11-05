@@ -59,7 +59,7 @@ func TestStackLimitOvershootBound(t *testing.T) {
 // TestStackLimitJustUnderSucceeds: a match whose held state equals the limit
 // succeeds, and the same match is refused once the limit is halfway down.
 func TestStackLimitJustUnderSucceeds(t *testing.T) {
-	in := lazyInput(8 << 10) + "'"
+	in := lazyInput(8<<10) + "'"
 	ok, err, peak := runLimited(t, lazyQuoted, in, 0)
 	if !ok || err != nil {
 		t.Fatalf("unlimited: ok=%v err=%v", ok, err)
@@ -129,25 +129,33 @@ func TestTrimToLimit(t *testing.T) {
 	}
 }
 
-// BenchmarkAnchoredVMLimit compares a VM-bound anchored match (lazy loop, ~3k
-// steps, a few hundred KiB of state) with no limit and with a limit it never
-// reaches. The two must not differ: the limit is checked only on growth.
+// BenchmarkAnchoredVMLimit compares VM-bound anchored matches with no limit and
+// with a limit they never reach. "steps" is 1024 single-class steps with almost
+// no backtrack state (the per-step cost of the old check is all there is);
+// "lazy" is a lazy loop around a capture group that grows stack and trail. The
+// two limits must not differ: the limit is checked only on growth.
 func BenchmarkAnchoredVMLimit(b *testing.B) {
-	in := lazyInput(32<<10) + "'"
-	for _, c := range []struct {
-		name  string
-		limit int
-	}{{"nolimit", 0}, {"limit1GiB", 1 << 30}} {
-		b.Run(c.name, func(b *testing.B) {
-			prog := build(b, lazyQuoted)
-			prog.StackLimit = c.limit
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				if _, ok, err := MatchAt(prog, in, 0, DefaultBudget); !ok || err != nil {
-					b.Fatalf("ok=%v err=%v", ok, err)
+	for _, shape := range []struct {
+		name, pat, in string
+	}{
+		{"steps", strings.Repeat(`[a-h]`, 1024), strings.Repeat("abcdefgh", 128)},
+		{"lazy", lazyQuoted, lazyInput(32<<10) + "'"},
+	} {
+		for _, c := range []struct {
+			name  string
+			limit int
+		}{{"nolimit", 0}, {"limit1GiB", 1 << 30}} {
+			b.Run(shape.name+"/"+c.name, func(b *testing.B) {
+				prog := build(b, shape.pat)
+				prog.StackLimit = c.limit
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, ok, err := MatchAt(prog, shape.in, 0, DefaultBudget); !ok || err != nil {
+						b.Fatalf("ok=%v err=%v", ok, err)
+					}
 				}
-			}
-		})
+			})
+		}
 	}
 }
