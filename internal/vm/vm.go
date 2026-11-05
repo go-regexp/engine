@@ -175,6 +175,9 @@ type machine struct {
 	trail []trailEntry
 	// stackLimit caps the bytes of stack+trail (0 == unlimited); see ErrStackLimit.
 	stackLimit int
+	// stackOver is set by refuseGrowth when the limit refused a growth; tick then
+	// reports ErrStackLimit instead of ErrBudget.
+	stackOver bool
 	// frames holds the call frames trailCallPop entries restore (see trailEntry).
 	frames []callFrame
 	// calls/openg/atomic are the live mutable stacks the trail rewinds. calls holds
@@ -441,6 +444,8 @@ func acquireMachine(prog *compile.Program, input string, budget int, deadline ti
 	m.input = input
 	m.budget = budget
 	m.stackLimit = prog.StackLimit
+	m.stackOver = false
+	m.trimToLimit()
 	m.deadline = deadline
 	m.clockTick = 0
 	m.gpos = 0
@@ -862,13 +867,13 @@ func (m *machine) loopEnter(pc int, in compile.Inst, sp int) (int, int, bool, er
 		// The current (longest) count is consumed by this very step; the pushed
 		// thread's next alternative is count-1, so record loopIdx = count and let
 		// loopResume pre-decrement.
-		m.stack = append(m.stack, t)
+		m.pushThread(t)
 		return cont, m.loopArena[base+count], true, nil
 	}
 	// Lazy: take the minimum now; on backtrack take one more toward the longest.
 	t := thread{pc: cont, trailMark: len(m.trail), kind: threadLoop,
 		loopBase: base, loopIdx: in.Min, loopMin: count, greedy: false}
-	m.stack = append(m.stack, t)
+	m.pushThread(t)
 	return cont, m.loopArena[base+in.Min], true, nil
 }
 
@@ -885,7 +890,7 @@ func (m *machine) loopResume(t thread) (int, int, bool) {
 		// Re-push so a further backtrack can give back again.
 		nt := t
 		nt.loopIdx = next
-		m.stack = append(m.stack, nt)
+		m.pushThread(nt)
 		return t.pc, m.loopArena[t.loopBase+next], true
 	}
 	next := t.loopIdx + 1
@@ -895,7 +900,7 @@ func (m *machine) loopResume(t thread) (int, int, bool) {
 	}
 	nt := t
 	nt.loopIdx = next
-	m.stack = append(m.stack, nt)
+	m.pushThread(nt)
 	return t.pc, m.loopArena[t.loopBase+next], true
 }
 
@@ -1246,12 +1251,14 @@ func (m *machine) execLookIn(lf *lookFrame, body, sp, endAt int, keep bool) (boo
 // so an unlimited search pays nothing for the timeout machinery.
 func (m *machine) tick() error {
 	if m.budget <= 0 {
+		// refuseGrowth zeroes the budget to land here, so the stack limit costs the
+		// hot path nothing: no extra load or compare per step.
+		if m.stackOver {
+			return ErrStackLimit
+		}
 		return ErrBudget
 	}
 	m.budget--
-	if m.stackLimit > 0 && len(m.stack)*threadBytes+len(m.trail)*trailBytes > m.stackLimit {
-		return ErrStackLimit
-	}
 	if !m.deadline.IsZero() {
 		m.clockTick++
 		if m.clockTick&clockCheckMask == 0 && time.Now().After(m.deadline) {
@@ -1259,6 +1266,53 @@ func (m *machine) tick() error {
 		}
 	}
 	return nil
+}
+
+// refuseGrowth is called only when m.stack or m.trail is full, i.e. when the next
+// append reallocates (Oniguruma's stack_double, regexec.c:1729-1783, checks the
+// limit at the same moment and nowhere else). It reports whether the growth must
+// be refused: the bytes the two slices already hold (capacity, not length) exceed
+// the limit. A refusal records ErrStackLimit and zeroes the step budget so the very
+// next tick aborts. Because the check passes only while held <= limit and one
+// growth at most doubles a slice, the pair never holds more than twice the limit
+// plus allocator rounding. Once held exceeds the limit it stays above it (the
+// capacity never shrinks within a match), so every later growth is refused too.
+func (m *machine) refuseGrowth() bool {
+	if m.stackLimit <= 0 || cap(m.stack)*threadBytes+cap(m.trail)*trailBytes <= m.stackLimit {
+		return false
+	}
+	m.stackOver = true
+	m.budget = 0
+	return true
+}
+
+// trimToLimit drops pooled stack/trail backing that already exceeds the limit. A
+// pooled machine may carry backing grown by an unlimited match; the limit is
+// checked only when a slice is full, so oversized backing would never trip it.
+// Dropping it starts the match from the limit's own footing.
+func (m *machine) trimToLimit() {
+	if m.stackLimit > 0 && cap(m.stack)*threadBytes+cap(m.trail)*trailBytes > m.stackLimit {
+		m.stack, m.trail = nil, nil
+	}
+}
+
+// pushThread appends t to the backtrack stack unless the limit refuses the growth.
+// A refused thread is dropped: the search aborts at the next tick and its state is
+// never read again.
+func (m *machine) pushThread(t thread) {
+	if len(m.stack) == cap(m.stack) && m.refuseGrowth() {
+		return
+	}
+	m.stack = append(m.stack, t)
+}
+
+// pushTrail appends e to the capture undo-trail unless the limit refuses the
+// growth (see pushThread).
+func (m *machine) pushTrail(e trailEntry) {
+	if len(m.trail) == cap(m.trail) && m.refuseGrowth() {
+		return
+	}
+	m.trail = append(m.trail, e)
 }
 
 // consumed is called after the main search advances past one or more input
@@ -1275,21 +1329,21 @@ func (m *machine) consumed() {
 // pos in place. The trail entry lets a backtrack restore the old value without
 // the per-save array copy the engine used before.
 func (m *machine) saveSlot(slot, pos int) {
-	m.trail = append(m.trail, trailEntry{kind: trailCap, slot: int32(slot), val: m.caps[slot]})
+	m.pushTrail(trailEntry{kind: trailCap, slot: int32(slot), val: m.caps[slot]})
 	m.caps[slot] = pos
 }
 
 // push records a backtrack alternative: the current trail length is its rewind
 // mark, so resuming it replays the trail back to here.
 func (m *machine) push(pc, sp int) {
-	m.stack = append(m.stack, thread{pc: pc, sp: sp, trailMark: len(m.trail)})
+	m.pushThread(thread{pc: pc, sp: sp, trailMark: len(m.trail)})
 }
 
 // pushCall pushes a pending subexpression-call frame and trails the push so a
 // backtrack pops it.
 func (m *machine) pushCall(f callFrame) {
 	m.calls = append(m.calls, f)
-	m.trail = append(m.trail, trailEntry{kind: trailCallPush})
+	m.pushTrail(trailEntry{kind: trailCallPush})
 }
 
 // popCall pops the top call frame and trails the pop so a backtrack restores it.
@@ -1298,21 +1352,21 @@ func (m *machine) popCall() callFrame {
 	f := m.calls[n]
 	m.calls = m.calls[:n]
 	m.frames = append(m.frames, f)
-	m.trail = append(m.trail, trailEntry{kind: trailCallPop, val: len(m.frames) - 1})
+	m.pushTrail(trailEntry{kind: trailCallPop, val: len(m.frames) - 1})
 	return f
 }
 
 // pushAtomic pushes an atomic-group mark (a backtrack-stack depth) and trails it.
 func (m *machine) pushAtomic(v int) {
 	m.atomic = append(m.atomic, v)
-	m.trail = append(m.trail, trailEntry{kind: trailAtomicPush})
+	m.pushTrail(trailEntry{kind: trailAtomicPush})
 }
 
 // popAtomic pops the top atomic mark and trails the pop.
 func (m *machine) popAtomic() {
 	v := m.atomic[len(m.atomic)-1]
 	m.atomic = m.atomic[:len(m.atomic)-1]
-	m.trail = append(m.trail, trailEntry{kind: trailAtomicPop, val: v})
+	m.pushTrail(trailEntry{kind: trailAtomicPop, val: v})
 }
 
 // trackOpen updates the open-group stack for an OpSave at the given slot,
@@ -1322,7 +1376,7 @@ func (m *machine) trackOpen(slot int) {
 	group := slot / 2
 	if slot%2 == 0 {
 		m.openg = append(m.openg, group)
-		m.trail = append(m.trail, trailEntry{kind: trailOpenPush})
+		m.pushTrail(trailEntry{kind: trailOpenPush})
 		return
 	}
 	// Close: pop the matching open. The compiler always pairs an open with its
@@ -1330,7 +1384,7 @@ func (m *machine) trackOpen(slot int) {
 	if len(m.openg) > 0 {
 		v := m.openg[len(m.openg)-1]
 		m.openg = m.openg[:len(m.openg)-1]
-		m.trail = append(m.trail, trailEntry{kind: trailOpenPop, val: v})
+		m.pushTrail(trailEntry{kind: trailOpenPop, val: v})
 	}
 }
 

@@ -209,10 +209,18 @@ func (re *Regexp) WithTimeout(d time.Duration) *Regexp {
 // "size = 0: unlimited"; its error is ONIGERR_MATCH_STACK_LIMIT_OVER).
 //
 // The limit counts the engine's backtrack stack and trail only, not the memo
-// table, and a growing slice may briefly hold up to twice what it counts. Without
-// it a loop around a capture group over a long input uses ~420 bytes per input
-// byte. The copy has its own compiled program (the limit lives in it), built on
-// first use.
+// table. Like Oniguruma's stack_double it is checked only when one of the two
+// slices is full and must grow, never per step, so it costs a match nothing
+// while the state is small. The check compares the bytes the two slices already
+// hold (capacity) with n, and a growth at most doubles one slice, so when the
+// refusal fires they hold at most 2*n bytes plus a few KiB of allocator rounding
+// (and the first allocation of each slice always succeeds, so a tiny n is still
+// not enforced below that). The converse: a match whose held state stays within
+// n is never refused, and the refusal comes when the next growth would start
+// from more than n, which can be before the state in use reaches n (by up to a
+// factor of about two). Without a limit a loop around a capture group over a long
+// input uses ~420 bytes per input byte. The copy has its own compiled program
+// (the limit lives in it), built on first use.
 func (re *Regexp) WithStackLimit(n int) *Regexp {
 	cp := *re
 	cp.m = &machine{res: re.m.res, enc: re.m.enc, stackLimit: max(n, 0)}
