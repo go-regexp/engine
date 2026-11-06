@@ -223,7 +223,14 @@ func (re *Regexp) WithTimeout(d time.Duration) *Regexp {
 // (the limit lives in it), built on first use.
 func (re *Regexp) WithStackLimit(n int) *Regexp {
 	cp := *re
-	cp.m = &machine{res: re.m.res, enc: re.m.enc, stackLimit: max(n, 0)}
+	// Share the lowered program, DFA and start filter with the original: only the
+	// Program header is copied (its slices are shared) to carry the limit.
+	re.m.build()
+	prog := *re.m.prog
+	prog.StackLimit = max(n, 0)
+	nm := &machine{res: re.m.res, enc: re.m.enc, stackLimit: prog.StackLimit, prog: &prog, dfa: re.m.dfa, start: re.m.start}
+	nm.once.Do(func() {}) // already built
+	cp.m = nm
 	return &cp
 }
 
